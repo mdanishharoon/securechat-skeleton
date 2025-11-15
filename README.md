@@ -1,111 +1,185 @@
 
 # SecureChat – Assignment #2 (CS-3002 Information Security, Fall 2025)
 
-This repository is the **official code skeleton** for your Assignment #2.  
-You will build a **console-based, PKI-enabled Secure Chat System** in **Python**, demonstrating how cryptographic primitives combine to achieve:
+A console-based secure chat system with PKI, demonstrating confidentiality, integrity, authenticity, and non-repudiation (CIANR).
 
-**Confidentiality, Integrity, Authenticity, and Non-Repudiation (CIANR)**.
+## What This Does
 
+This is a simple client-server chat application that uses real cryptography at the application layer. Everything is encrypted, signed, and verified - no plaintext passwords, no TLS shortcuts. The assignment focuses on understanding how crypto primitives work together to build secure systems.
 
-## 🧩 Overview
-
-You are provided only with the **project skeleton and file hierarchy**.  
-Each file contains docstrings and `TODO` markers describing what to implement.
-
-Your task is to:
-- Implement the **application-layer protocol**.
-- Integrate cryptographic primitives correctly to satisfy the assignment spec.
-- Produce evidence of security properties via Wireshark, replay/tamper tests, and signed session receipts.
-
-## 🏗️ Folder Structure
+## Project Structure
 ```
 securechat-skeleton/
 ├─ app/
-│  ├─ client.py              # Client workflow (plain TCP, no TLS)
-│  ├─ server.py              # Server workflow (plain TCP, no TLS)
+│  ├─ client.py              # Client workflow
+│  ├─ server.py              # Server workflow  
 │  ├─ crypto/
-│  │  ├─ aes.py              # AES-128(ECB)+PKCS#7 (use cryptography lib)
-│  │  ├─ dh.py               # Classic DH helpers + key derivation
-│  │  ├─ pki.py              # X.509 validation (CA signature, validity, CN)
-│  │  └─ sign.py             # RSA SHA-256 sign/verify (PKCS#1 v1.5)
+│  │  ├─ aes.py              # AES-128 encryption (ECB + PKCS#7)
+│  │  ├─ dh.py               # Diffie-Hellman key exchange
+│  │  ├─ pki.py              # Certificate validation
+│  │  └─ sign.py             # RSA signatures
 │  ├─ common/
-│  │  ├─ protocol.py         # Pydantic message models (hello/login/msg/receipt)
-│  │  └─ utils.py            # Helpers (base64, now_ms, sha256_hex)
+│  │  ├─ protocol.py         # Message models
+│  │  └─ utils.py            # Helper functions
 │  └─ storage/
-│     ├─ db.py               # MySQL user store (salted SHA-256 passwords)
-│     └─ transcript.py       # Append-only transcript + transcript hash
+│     ├─ db.py               # MySQL with salted passwords
+│     └─ transcript.py       # Session transcripts
 ├─ scripts/
-│  ├─ gen_ca.py              # Create Root CA (RSA + self-signed X.509)
-│  └─ gen_cert.py            # Issue client/server certs signed by Root CA
-├─ tests/manual/NOTES.md     # Manual testing + Wireshark evidence checklist
-├─ certs/.keep               # Local certs/keys (gitignored)
-├─ transcripts/.keep         # Session logs (gitignored)
-├─ .env.example              # Sample configuration (no secrets)
-├─ .gitignore                # Ignore secrets, binaries, logs, and certs
-├─ requirements.txt          # Minimal dependencies
-└─ .github/workflows/ci.yml  # Compile-only sanity check (no execution)
+│  ├─ gen_ca.py              # Create root CA
+│  └─ gen_cert.py            # Issue certificates
+├─ certs/                    # Generated certificates (gitignored)
+├─ transcripts/              # Chat logs (gitignored)
+└─ .env                      # Config (gitignored)
 ```
 
-## ⚙️ Setup Instructions
+## Setup
 
-1. **Fork this repository** to your own GitHub account(using official nu email).  
-   All development and commits must be performed in your fork.
+### 1. Clone and Install Dependencies
 
-2. **Set up environment**:
-   ```bash
-   python3 -m venv .venv && source .venv/bin/activate
-   pip install -r requirements.txt
-   cp .env.example .env
-   ```
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-3. **Initialize MySQL** (recommended via Docker):
-   ```bash
-   docker run -d --name securechat-db        -e MYSQL_ROOT_PASSWORD=rootpass        -e MYSQL_DATABASE=securechat        -e MYSQL_USER=scuser        -e MYSQL_PASSWORD=scpass        -p 3306:3306 mysql:8
-   ```
+### 2. Configure Environment
 
-4. **Create tables**:
-   ```bash
-   python -m app.storage.db --init
-   ```
+Copy the example config and fill in your MySQL details:
 
-5. **Generate certificates** (after implementing the scripts):
-   ```bash
-   python scripts/gen_ca.py --name "FAST-NU Root CA"
-   python scripts/gen_cert.py --cn server.local --out certs/server
-   python scripts/gen_cert.py --cn client.local --out certs/client
-   ```
+```bash
+cp .env.example .env
+```
 
-6. **Run components** (after implementation):
-   ```bash
-   python -m app.server
-   # in another terminal:
-   python -m app.client
-   ```
+Edit `.env` with your database credentials. If you're using a remote MySQL host, make sure remote connections are enabled.
 
-## 🚫 Important Rules
+### 3. Initialize Database
 
-- **Do not use TLS/SSL or any secure-channel abstraction**  
-  (e.g., `ssl`, HTTPS, WSS, OpenSSL socket wrappers).  
-  All crypto operations must occur **explicitly** at the application layer.
+```bash
+python -m app.storage.db --init
+```
 
-- You are **not required** to implement AES, RSA, or DH math, Use any of the available libraries.
-- Do **not commit secrets** (certs, private keys, salts, `.env` values).
-- Your commits must reflect progressive development — at least **10 meaningful commits**.
+Test it works:
+```bash
+python -m app.storage.db --test
+```
 
-## 🧾 Deliverables
+### 4. Generate Certificates
 
-When submitting on Google Classroom (GCR):
+First create the root CA:
+```bash
+python scripts/gen_ca.py --name "FAST-NU Root CA"
+```
 
-1. A ZIP of your **GitHub fork** (repository).
-2. MySQL schema dump and a few sample records.
-3. Updated **README.md** explaining setup, usage, and test outputs.
-4. `RollNumber-FullName-Report-A02.docx`
-5. `RollNumber-FullName-TestReport-A02.docx`
+Then generate server and client certificates:
+```bash
+python scripts/gen_cert.py --cn server.local --out certs/server
+python scripts/gen_cert.py --cn client.local --out certs/client
+```
 
-## 🧪 Test Evidence Checklist
+You should now have these files in `certs/`:
+- `ca-cert.pem` / `ca-key.pem`
+- `server-cert.pem` / `server-key.pem`
+- `client-cert.pem` / `client-key.pem`
 
-✔ Wireshark capture (encrypted payloads only)  
-✔ Invalid/self-signed cert rejected (`BAD_CERT`)  
-✔ Tamper test → signature verification fails (`SIG_FAIL`)  
-✔ Replay test → rejected by seqno (`REPLAY`)  
-✔ Non-repudiation → exported transcript + signed SessionReceipt verified offline  
+## Running the Chat
+
+### Start the Server
+
+```bash
+python -m app.server
+```
+
+Server will listen on port 5000 (configurable in `.env`).
+
+### Connect a Client
+
+In another terminal, register a new user:
+```bash
+python -m app.client --register --email alice@example.com --username alice --password pass123
+```
+
+Or login with existing credentials:
+```bash
+python -m app.client --email alice@example.com --password pass123
+```
+
+Once connected, type messages and press enter. Type `quit` to exit.
+
+## How It Works
+
+### Phase 1: Certificate Exchange
+Both sides exchange X.509 certificates and validate them against the root CA. Checks include signature verification, expiry dates, and CN/SAN matching.
+
+### Phase 2: Temporary DH Key Exchange
+A Diffie-Hellman exchange creates a temporary shared secret, which gets hashed and truncated to a 16-byte AES key. This key is used to encrypt the registration or login payload.
+
+### Phase 3: Registration/Login
+Client sends encrypted credentials. Server decrypts, generates a random 16-byte salt per user, computes `SHA256(salt || password)`, and stores it in MySQL. No plaintext passwords anywhere.
+
+### Phase 4: Session DH Key Exchange
+Another DH exchange creates a fresh session key for the actual chat messages.
+
+### Phase 5: Encrypted Chat
+Messages are encrypted with AES-128, then signed with RSA. Each message has a sequence number to prevent replay attacks. Everything gets logged to an append-only transcript.
+
+### Phase 6: Session Receipt
+When the chat ends, the server computes a SHA-256 hash of the entire transcript, signs it with its private key, and sends it to the client. This proves the conversation happened and can't be tampered with later.
+
+## Security Properties
+
+- **Confidentiality**: AES-128 encryption for all messages
+- **Integrity**: SHA-256 digests detect tampering
+- **Authenticity**: RSA signatures prove who sent what
+- **Non-repudiation**: Signed transcripts provide cryptographic proof
+- **Replay protection**: Sequence numbers prevent message replay
+
+## Testing
+
+You can check various security properties:
+
+**Test certificate validation:**
+Try using a self-signed cert or an expired one - the server should reject it with `BAD_CERT`.
+
+**Test message tampering:**
+Modify a ciphertext byte in transit (you'd need to intercept it) - signature verification will fail with `SIG_FAIL`.
+
+**Test replay attacks:**
+Try resending an old message with the same sequence number - server rejects it with `REPLAY`.
+
+**Wireshark capture:**
+Run `wireshark` or `tcpdump` while chatting. You should only see encrypted payloads on the wire, no plaintext.
+
+## Project Notes
+
+This was built for the Information Security course at FAST-NUCES. The goal was to implement application-layer crypto without using TLS, so we could see how all the pieces fit together.
+
+The implementation uses the `cryptography` library for the heavy lifting (AES, RSA, X.509), but all the protocol logic and key exchange is custom. MySQL stores user credentials with proper salted hashing.
+
+Transcripts are saved locally in the `transcripts/` directory with a format like:
+```
+seqno | timestamp | ciphertext_b64 | signature_b64 | peer_fingerprint
+```
+
+At the end of each session, both sides can verify their transcript hashes match and check the signature on the receipt.
+
+## Common Issues
+
+**Database connection fails:** Make sure your MySQL server allows remote connections if you're using a remote host. Check your `.env` credentials.
+
+**Certificate errors:** Verify all certificates are in the `certs/` directory and properly generated. The CN in the certificate should match what's being validated.
+
+**Import errors:** Activate your virtual environment: `source venv/bin/activate`
+
+## Assignment Requirements
+
+This implementation covers all the assignment requirements:
+- PKI with CA-signed certificates
+- Salted password hashing in MySQL
+- DH key exchange with proper key derivation
+- AES-128 encryption with PKCS#7 padding
+- RSA signatures for authenticity
+- Replay protection with sequence numbers
+- Non-repudiation with signed transcripts
+- No TLS or SSL (everything is application-layer)
+
+Check `tests/manual/NOTES.md` for testing evidence and Wireshark captures.
