@@ -51,30 +51,35 @@ def init_db():
         conn.close()
 
 
-def register_user(email: str, username: str, password: str) -> tuple[bool, str]:
+def register_user(email: str, username: str, pwd_hash_b64: str, salt_b64: str) -> tuple[bool, str]:
     """
-    Register a new user with salted password hashing.
+    Register a new user with client-provided salt and password hash.
     
     Args:
         email: User email (unique)
         username: Username (unique)
-        password: Plain password (will be salted and hashed)
+        pwd_hash_b64: base64-encoded SHA256(salt + password) from client
+        salt_b64: base64-encoded 16-byte salt from client
         
     Returns:
         (success, message) tuple
     """
+    import base64
+    
     conn = get_connection()
     try:
-        # Generate random 16-byte salt
-        salt = secrets.token_bytes(16)
+        # Decode salt and password hash from client
+        salt = base64.b64decode(salt_b64)
+        pwd_hash_bytes = base64.b64decode(pwd_hash_b64)
+        pwd_hash_hex = pwd_hash_bytes.hex()
         
-        # Compute pwd_hash = hex(SHA256(salt || password))
-        pwd_hash = hashlib.sha256(salt + password.encode('utf-8')).hexdigest()
+        print(f"[DEBUG] Registration - salt: {salt.hex()}")
+        print(f"[DEBUG] Registration - hash: {pwd_hash_hex}")
         
         with conn.cursor() as cursor:
             cursor.execute(
                 "INSERT INTO users (email, username, salt, pwd_hash) VALUES (%s, %s, %s, %s)",
-                (email, username, salt, pwd_hash)
+                (email, username, salt, pwd_hash_hex)
             )
             conn.commit()
             return (True, f"User '{username}' registered successfully")
@@ -92,13 +97,13 @@ def register_user(email: str, username: str, password: str) -> tuple[bool, str]:
         conn.close()
 
 
-def authenticate_user(email: str, password: str) -> tuple[bool, str, str]:
+def authenticate_user(email: str, pwd_hash: str) -> tuple[bool, str, str]:
     """
     Authenticate user by verifying salted password hash.
     
     Args:
         email: User email
-        password: Plain password to verify
+        pwd_hash: base64-encoded SHA256(salt + password) sent by client
         
     Returns:
         (success, message, username) tuple
@@ -109,7 +114,7 @@ def authenticate_user(email: str, password: str) -> tuple[bool, str, str]:
     try:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT username, salt, pwd_hash FROM users WHERE email = %s",
+                "SELECT username, pwd_hash FROM users WHERE email = %s",
                 (email,)
             )
             result = cursor.fetchone()
@@ -118,13 +123,17 @@ def authenticate_user(email: str, password: str) -> tuple[bool, str, str]:
                 return (False, "AUTH_FAIL: Invalid email or password", "")
             
             username = result['username']
-            salt = result['salt']
             stored_hash = result['pwd_hash']
             
-            # Recompute hash with stored salt
-            computed_hash = hashlib.sha256(salt + password.encode('utf-8')).hexdigest()
+            # Client sends base64, we need to decode and hex it
+            import base64
+            received_hash_bytes = base64.b64decode(pwd_hash)
+            received_hash_hex = received_hash_bytes.hex()
             
-            if computed_hash == stored_hash:
+            print(f"[DEBUG] Stored hash:   {stored_hash}")
+            print(f"[DEBUG] Received hash: {received_hash_hex}")
+            
+            if received_hash_hex == stored_hash:
                 return (True, "OK", username)
             else:
                 return (False, "AUTH_FAIL: Invalid email or password", "")

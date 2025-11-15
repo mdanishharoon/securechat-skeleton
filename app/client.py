@@ -4,9 +4,11 @@ import socket
 import json
 import secrets
 import hashlib
+import sys
 from dotenv import load_dotenv
 from app.common.protocol import (
-    HelloMsg, ServerHelloMsg, RegisterMsg, LoginMsg,
+    HelloMsg, ServerHelloMsg, RegisterMsg, LoginMsg, RegisterResponseMsg,
+    SaltRequestMsg, SaltResponseMsg,
     DHClientMsg, DHServerMsg, ChatMsg, ReceiptMsg, ErrorMsg, OkMsg
 )
 from app.common.utils import now_ms, b64e, b64d, sha256_hex
@@ -16,15 +18,65 @@ from app.storage.transcript import Transcript
 load_dotenv()
 
 
+def _ensure_client_cert():
+    """Auto-generate client certificate if it doesn't exist."""
+    cert_path = os.getenv("CLIENT_CERT_PATH", "certs/client-cert.pem")
+    key_path = os.getenv("CLIENT_KEY_PATH", "certs/client-key.pem")
+    
+    if not os.path.exists(cert_path) or not os.path.exists(key_path):
+        print("[*] Client certificate not found, generating one...")
+        
+        # Import and call directly instead of subprocess
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sys.path.insert(0, project_root)
+        
+        from scripts.gen_cert import generate_cert
+        
+        try:
+            generate_cert(
+                cn="client",
+                output_prefix="certs/client",
+                ca_cert_path="certs/ca-cert.pem",
+                ca_key_path="certs/ca-key.pem"
+            )
+            print(f"[+] Client certificate generated successfully")
+        except Exception as e:
+            print(f"[!] Failed to generate certificate: {e}")
+            print(f"[*] Please run manually: python scripts/gen_cert.py --cn client --out certs/client")
+            raise
+
+
 class SecureChatClient:
     """Secure chat client with PKI, DH, and encrypted messaging."""
     
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, username: str = None):
         self.host = host
         self.port = port
+        self.username = username
         self.ca_cert = self._load_file(os.getenv("CA_CERT_PATH", "certs/ca-cert.pem"))
-        self.client_cert = self._load_file(os.getenv("CLIENT_CERT_PATH", "certs/client-cert.pem"))
-        self.client_key = self._load_file(os.getenv("CLIENT_KEY_PATH", "certs/client-key.pem"))
+        
+        # Load user-specific certificate if username provided (for login)
+        if username:
+            cert_path = f"certs/{username}-cert.pem"
+            key_path = f"certs/{username}-key.pem"
+            
+            if not os.path.exists(cert_path) or not os.path.exists(key_path):
+                raise FileNotFoundError(
+                    f"Certificate not found for user '{username}'. "
+                    f"Please register first with: python -m app.client --register --username {username}"
+                )
+            
+            self.client_cert = self._load_file(cert_path)
+            self.client_key = self._load_file(key_path)
+            print(f"[*] Loaded certificate for user: {username}")
+        else:
+            # For registration, use temporary bootstrap cert
+            # Generate temporary cert if doesn't exist
+            _ensure_client_cert()
+            self.client_cert = self._load_file("certs/client-cert.pem")
+            self.client_key = self._load_file("certs/client-key.pem")
+            print(f"[*] Using bootstrap certificate for registration")
+        
         self.sock = None
         self.session_key = None
         self.server_cert = None
@@ -100,8 +152,10 @@ class SecureChatClient:
         return aes_key
     
     def register(self, email: str, username: str, password: str):
-        """Register a new user."""
+        """Register a new user and receive user-specific certificate."""
+        print(f"[*] Starting registration for {username}...")
         temp_key = self._temp_dh_exchange()
+        print(f"[*] DH exchange complete, encrypting registration data...")
         
         # Generate salt and hash password
         salt = secrets.token_bytes(16)
@@ -122,29 +176,70 @@ class SecureChatClient:
         # Send encrypted payload
         payload = {"encrypted_payload": b64e(ct)}
         self.sock.sendall(json.dumps(payload).encode('utf-8'))
+        print(f"[*] Registration data sent, waiting for response...")
         
-        # Receive response
-        data = self.sock.recv(4096).decode('utf-8')
+        # Receive encrypted response
+        data = self.sock.recv(8192).decode('utf-8')
+        msg_json = json.loads(data)
         
-        try:
-            error = ErrorMsg.model_validate_json(data)
+        # Check if it's an error
+        if msg_json.get('type') == 'error':
+            error = ErrorMsg.model_validate(msg_json)
             print(f"[!] Registration failed: {error.message}")
             return False
-        except:
-            pass
         
-        ok = OkMsg.model_validate_json(data)
-        print(f"[+] {ok.message}")
+        # Decrypt response
+        ct = b64d(msg_json['encrypted_payload'])
+        plaintext = aes.decrypt(temp_key, ct).decode('utf-8')
+        response = RegisterResponseMsg.model_validate_json(plaintext)
+        
+        # Save user certificate and key
+        import os
+        os.makedirs("certs", exist_ok=True)
+        
+        cert_path = f"certs/{username}-cert.pem"
+        key_path = f"certs/{username}-key.pem"
+        
+        with open(cert_path, "w") as f:
+            f.write(response.user_cert)
+        with open(key_path, "w") as f:
+            f.write(response.user_key)
+        
+        print(f"[+] {response.message}")
+        print(f"[+] Certificate saved to {cert_path}")
+        print(f"[+] Private key saved to {key_path}")
+        print(f"[!] Keep your private key secure!")
+        
         return True
     
     def login(self, email: str, password: str):
         """Login with existing credentials."""
+        # First, request the user's salt
+        salt_request = SaltRequestMsg(email=email)
+        self.sock.sendall(salt_request.model_dump_json().encode('utf-8'))
+        
+        # Receive salt response
+        data = self.sock.recv(4096).decode('utf-8')
+        
+        try:
+            error = ErrorMsg.model_validate_json(data)
+            print(f"[!] Failed to get salt: {error.message}")
+            return False
+        except:
+            pass
+        
+        salt_response = SaltResponseMsg.model_validate_json(data)
+        salt = b64d(salt_response.salt)
+        
+        print(f"[DEBUG] Received salt: {salt.hex()}")
+        
+        # Now do temp DH exchange for encrypted login
         temp_key = self._temp_dh_exchange()
         
-        # Hash password (same way as registration, but we need the salt from server)
-        # For simplicity, we'll send plaintext pwd (spec says send hashed, but we need salt first)
-        # In production, client would request salt first
-        pwd_hash = hashlib.sha256(password.encode('utf-8')).digest()
+        # Hash password with salt
+        pwd_hash = hashlib.sha256(salt + password.encode('utf-8')).digest()
+        
+        print(f"[DEBUG] Computed hash: {pwd_hash.hex()}")
         
         # Create login message
         login_msg = LoginMsg(
@@ -282,12 +377,20 @@ def main():
     parser.add_argument("--port", type=int, default=int(os.getenv("SERVER_PORT", 5000)), help="Server port")
     parser.add_argument("--register", action="store_true", help="Register new user")
     parser.add_argument("--email", help="User email")
-    parser.add_argument("--username", help="Username (for registration)")
+    parser.add_argument("--username", help="Username")
     parser.add_argument("--password", help="Password")
     
     args = parser.parse_args()
     
-    client = SecureChatClient(args.host, args.port)
+    # For login, username is required to load the correct certificate
+    if not args.register and not args.username:
+        print(f"[!] Login requires --username to load your certificate")
+        print(f"[*] Example: python -m app.client --username alice --email alice@example.com --password pass123")
+        return
+    
+    # Create client with username (None for registration, specific user for login)
+    username_for_cert = args.username if not args.register else None
+    client = SecureChatClient(args.host, args.port, username=username_for_cert)
     
     try:
         # Connect and exchange certificates
@@ -305,6 +408,10 @@ def main():
             
             if not client.register(args.email, args.username, args.password):
                 return
+            
+            print(f"\n[+] Registration complete! You can now login with:")
+            print(f"    python -m app.client --username {args.username} --email {args.email} --password YOUR_PASSWORD")
+            return
         else:
             if not args.email or not args.password:
                 print(f"[!] Login requires --email and --password")

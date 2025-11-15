@@ -3,9 +3,11 @@ import os
 import socket
 import json
 import secrets
+import sys
 from dotenv import load_dotenv
 from app.common.protocol import (
-    HelloMsg, ServerHelloMsg, RegisterMsg, LoginMsg,
+    HelloMsg, ServerHelloMsg, RegisterMsg, LoginMsg, RegisterResponseMsg,
+    SaltRequestMsg, SaltResponseMsg,
     DHClientMsg, DHServerMsg, ChatMsg, ReceiptMsg, ErrorMsg, OkMsg
 )
 from app.common.utils import now_ms, b64e, b64d, sha256_hex
@@ -16,10 +18,39 @@ from app.storage.transcript import Transcript
 load_dotenv()
 
 
+def _ensure_server_cert():
+    """Auto-generate server certificate if it doesn't exist."""
+    cert_path = os.getenv("SERVER_CERT_PATH", "certs/server-cert.pem")
+    key_path = os.getenv("SERVER_KEY_PATH", "certs/server-key.pem")
+    
+    if not os.path.exists(cert_path) or not os.path.exists(key_path):
+        print("[*] Server certificate not found, generating one...")
+        
+        # Import and call directly instead of subprocess
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sys.path.insert(0, project_root)
+        
+        from scripts.gen_cert import generate_cert
+        
+        try:
+            generate_cert(
+                cn="server",
+                output_prefix="certs/server",
+                ca_cert_path="certs/ca-cert.pem",
+                ca_key_path="certs/ca-key.pem"
+            )
+            print(f"[+] Server certificate generated successfully")
+        except Exception as e:
+            print(f"[!] Failed to generate certificate: {e}")
+            print(f"[*] Please run manually: python scripts/gen_cert.py --cn server --out certs/server")
+            raise
+
+
 class SecureChatServer:
     """Secure chat server with PKI, DH, and encrypted messaging."""
     
     def __init__(self, host: str, port: int):
+        _ensure_server_cert()  # Auto-generate if missing
         self.host = host
         self.port = port
         self.ca_cert = self._load_file(os.getenv("CA_CERT_PATH", "certs/ca-cert.pem"))
@@ -42,13 +73,33 @@ class SecureChatServer:
             if not client_cert:
                 return
             
-            # Phase 2: Temporary DH for Registration/Login
-            temp_key = self._temp_dh_exchange(conn)
+            # Phase 1.5: Check if client requests salt (for login) or starts DH (for registration)
+            # Receive first message and check type
+            first_msg_data = conn.recv(4096).decode('utf-8')
+            first_msg = json.loads(first_msg_data)
+            
+            if first_msg.get('type') == 'salt_request':
+                # Handle salt request for login
+                salt_req = SaltRequestMsg.model_validate(first_msg)
+                if not self._handle_salt_request(conn, salt_req.email):
+                    return
+                
+                # Now do temp DH exchange
+                temp_key = self._temp_dh_exchange(conn)
+            elif first_msg.get('type') == 'dh_client':
+                # This is registration - already have the DH message
+                dh_client = DHClientMsg.model_validate(first_msg)
+                temp_key = self._complete_dh_exchange(conn, dh_client)
+            else:
+                error = ErrorMsg(code="INVALID_MSG", message="Expected salt_request or dh_client")
+                conn.sendall(error.model_dump_json().encode('utf-8'))
+                return
+            
             if not temp_key:
                 return
             
             # Phase 3: Registration or Login
-            username = self._handle_auth(conn, temp_key)
+            username = self._handle_auth(conn, temp_key, client_cert)
             if not username:
                 return
             
@@ -105,6 +156,32 @@ class SecureChatServer:
         
         return client_cert, client_nonce
     
+    def _handle_salt_request(self, conn: socket.socket, email: str) -> bool:
+        """
+        Handle salt request for login.
+        Returns: True on success, False on failure
+        """
+        from app.storage.db import get_user_salt
+        
+        try:
+            salt = get_user_salt(email)
+            if not salt:
+                error = ErrorMsg(code="USER_NOT_FOUND", message="User not found")
+                conn.sendall(error.model_dump_json().encode('utf-8'))
+                return False
+            
+            print(f"[DEBUG] Salt for {email}: {salt.hex()}")
+            
+            response = SaltResponseMsg(salt=b64e(salt))
+            conn.sendall(response.model_dump_json().encode('utf-8'))
+            print(f"[+] Sent salt for user: {email}")
+            return True
+            
+        except Exception as e:
+            error = ErrorMsg(code="SALT_ERROR", message=str(e))
+            conn.sendall(error.model_dump_json().encode('utf-8'))
+            return False
+    
     def _temp_dh_exchange(self, conn: socket.socket) -> bytes:
         """
         Perform temporary DH exchange for registration/login encryption.
@@ -114,6 +191,13 @@ class SecureChatServer:
         data = conn.recv(4096).decode('utf-8')
         dh_client = DHClientMsg.model_validate_json(data)
         
+        return self._complete_dh_exchange(conn, dh_client)
+    
+    def _complete_dh_exchange(self, conn: socket.socket, dh_client: DHClientMsg) -> bytes:
+        """
+        Complete DH exchange when we already have the client DH message.
+        Returns: 16-byte AES key or None on failure
+        """
         # Server generates DH keypair
         server_private, server_public = dh.full_dh_exchange_client(dh_client.p, dh_client.g)
         
@@ -128,9 +212,10 @@ class SecureChatServer:
         print(f"[+] Temporary DH key exchange complete")
         return aes_key
     
-    def _handle_auth(self, conn: socket.socket, temp_key: bytes) -> str:
+    def _handle_auth(self, conn: socket.socket, temp_key: bytes, client_cert: bytes) -> str:
         """
         Handle registration or login (encrypted with temp DH key).
+        For login, validates that cert CN matches username.
         Returns: username on success, None on failure
         """
         # Receive encrypted auth message
@@ -146,33 +231,89 @@ class SecureChatServer:
         
         if msg_type == 'register':
             reg = RegisterMsg.model_validate(auth_data)
-            success, message = register_user(reg.email, reg.username, reg.pwd)
+            success, message = register_user(reg.email, reg.username, reg.pwd, reg.salt)
             
-            if success:
-                response = OkMsg(message=f"Registration successful: {reg.username}")
-                print(f"[+] Registered user: {reg.username}")
-            else:
+            if not success:
                 response = ErrorMsg(code="REG_FAIL", message=message)
                 print(f"[!] Registration failed: {message}")
                 conn.sendall(response.model_dump_json().encode('utf-8'))
                 return None
             
-            conn.sendall(response.model_dump_json().encode('utf-8'))
+            print(f"[+] Registered user: {reg.username}")
+            
+            # Generate user-specific certificate
+            print(f"[*] Generating certificate for user: {reg.username}")
+            from scripts.gen_cert import generate_cert
+            import tempfile
+            import os
+            
+            try:
+                # Generate cert in temporary location
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    output_prefix = os.path.join(tmpdir, reg.username)
+                    generate_cert(
+                        cn=reg.username,
+                        output_prefix=output_prefix,
+                        ca_cert_path="certs/ca-cert.pem",
+                        ca_key_path="certs/ca-key.pem"
+                    )
+                    
+                    # Read generated cert and key
+                    with open(f"{output_prefix}-cert.pem", "rb") as f:
+                        user_cert = f.read().decode('utf-8')
+                    with open(f"{output_prefix}-key.pem", "rb") as f:
+                        user_key = f.read().decode('utf-8')
+                
+                print(f"[+] Generated certificate for {reg.username}")
+                
+                # Send encrypted response with certificate
+                response = RegisterResponseMsg(
+                    user_cert=user_cert,
+                    user_key=user_key,
+                    message=f"Registration successful: {reg.username}"
+                )
+                
+                # Encrypt the response with temp key
+                response_json = response.model_dump_json()
+                encrypted_response = aes.encrypt(temp_key, response_json.encode('utf-8'))
+                
+                encrypted_msg = {
+                    "type": "encrypted",
+                    "encrypted_payload": b64e(encrypted_response)
+                }
+                conn.sendall(json.dumps(encrypted_msg).encode('utf-8'))
+                
+            except Exception as e:
+                print(f"[!] Failed to generate certificate: {e}")
+                response = ErrorMsg(code="CERT_GEN_FAIL", message=str(e))
+                conn.sendall(response.model_dump_json().encode('utf-8'))
+                return None
+            
             return reg.username
         
         elif msg_type == 'login':
             login = LoginMsg.model_validate(auth_data)
             success, message, username = authenticate_user(login.email, login.pwd)
             
-            if success:
-                response = OkMsg(message=f"Login successful: {username}")
-                print(f"[+] User logged in: {username}")
-            else:
+            if not success:
                 response = ErrorMsg(code="AUTH_FAIL", message=message)
                 print(f"[!] Login failed: {message}")
                 conn.sendall(response.model_dump_json().encode('utf-8'))
                 return None
             
+            # Validate that client certificate CN matches the logged-in username
+            client_cn = pki.get_cert_cn(client_cert)
+            if client_cn != username:
+                error_msg = f"Certificate CN '{client_cn}' does not match username '{username}'"
+                response = ErrorMsg(code="CERT_MISMATCH", message=error_msg)
+                print(f"[!] Certificate mismatch: {error_msg}")
+                conn.sendall(response.model_dump_json().encode('utf-8'))
+                return None
+            
+            print(f"[+] Certificate CN verified: {client_cn} == {username}")
+            
+            response = OkMsg(message=f"Login successful: {username}")
+            print(f"[+] User logged in: {username}")
             conn.sendall(response.model_dump_json().encode('utf-8'))
             return username
         

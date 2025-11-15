@@ -1,3 +1,4 @@
+"""Pydantic models: hello, server_hello, register, login, dh_client, dh_server, msg, receipt."""
 from pydantic import BaseModel
 from typing import Literal
 
@@ -25,12 +26,32 @@ class RegisterMsg(BaseModel):
     salt: str  # base64
 
 
+class RegisterResponseMsg(BaseModel):
+    """Registration response with user certificate and private key."""
+    type: Literal["register_response"] = "register_response"
+    user_cert: str  # PEM format
+    user_key: str  # PEM format (encrypted with temp DH key for transport)
+    message: str = "Registration successful"
+
+
 class LoginMsg(BaseModel):
     """Login message (encrypted with temporary DH key)."""
     type: Literal["login"] = "login"
     email: str
     pwd: str  # base64(sha256(salt||password))
     nonce: str  # base64
+
+
+class SaltRequestMsg(BaseModel):
+    """Request user's salt for login."""
+    type: Literal["salt_request"] = "salt_request"
+    email: str
+
+
+class SaltResponseMsg(BaseModel):
+    """Response with user's salt."""
+    type: Literal["salt_response"] = "salt_response"
+    salt: str  # base64
 
 
 class DHClientMsg(BaseModel):
